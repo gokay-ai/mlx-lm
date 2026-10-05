@@ -16,13 +16,15 @@ from mlx_lm.generate import TextStateMachine
 from mlx_lm.models.cache import KVCache, QuantizedKVCache
 from mlx_lm.server import (
     APIHandler,
+    GenerationContext,
     LRUPromptCache,
+    Response,
     ResponseGenerator,
     SamplingArguments,
     ToolCallFormatter,
     _make_sampler,
 )
-from mlx_lm.tool_parsers import pythonic
+from mlx_lm.tool_parsers import json_tools, pythonic
 from mlx_lm.utils import load
 
 
@@ -220,8 +222,9 @@ class TestToolCallFormatter(unittest.TestCase):
             'grocery.order(items=[{"name": "noodles", "organic": true}])]'
         )
 
-        tool_calls = formatter([raw_tool_call])
+        tool_calls, unparsed = formatter([raw_tool_call])
 
+        self.assertEqual(unparsed, "")
         self.assertEqual(
             [tc["function"]["name"] for tc in tool_calls],
             ["get_time", "grocery.order"],
@@ -231,6 +234,94 @@ class TestToolCallFormatter(unittest.TestCase):
             json.loads(tool_calls[1]["function"]["arguments"]),
             {"items": [{"name": "noodles", "organic": True}]},
         )
+
+    def test_returns_unparsed_tool_call_text(self):
+        formatter = ToolCallFormatter(json_tools.parse_tool_call, tools=None)
+        bad = '\n{{"name": "get_weather", "arguments": {"city": "Tokyo"}}}\n'
+        good = '{"name": "get_time", "arguments": {}}'
+
+        tool_calls, unparsed = formatter([bad, good])
+
+        self.assertEqual([tc["function"]["name"] for tc in tool_calls], ["get_time"])
+        self.assertEqual(unparsed, bad)
+
+
+class TestUnparsedToolCallResponse(unittest.TestCase):
+    """A tool call the parser rejects must not be reported as a tool call."""
+
+    def _run(self, chunks, stream):
+        handler = mock.MagicMock()
+        handler.stream = stream
+        handler.logprobs = False
+        handler.top_logprobs = -1
+        handler.stream_options = None
+        handler.request_id = "chatcmpl-test"
+        handler.system_fingerprint = "test"
+        handler.object_type = "chat.completion.chunk" if stream else "chat.completion"
+        handler.requested_model = "test-model"
+        handler.created = 0
+        handler.wfile = io.BytesIO()
+        handler.generate_response = lambda *a, **kw: APIHandler.generate_response(
+            handler, *a, **kw
+        )
+
+        ctx = GenerationContext(
+            has_tool_calling=True,
+            has_thinking=False,
+            tool_parser=json_tools.parse_tool_call,
+            text_sm=TextStateMachine(
+                {
+                    "normal": [("<tool_call>", "tool")],
+                    "tool": [("</tool_call>", "normal")],
+                }
+            ),
+            initial_state="normal",
+            prompt=[1, 2, 3],
+        )
+        responses = [Response(text, i, 0.0, None, ()) for i, text in enumerate(chunks)]
+        responses.append(Response("", len(chunks), 0.0, "stop", ()))
+        handler.response_generator.generate.return_value = (ctx, iter(responses))
+
+        request = mock.MagicMock()
+        request.tools = None
+        APIHandler.handle_completion(handler, request, [])
+
+        body = handler.wfile.getvalue().decode()
+        if not stream:
+            return [json.loads(body)]
+        return [
+            json.loads(line[len("data: ") :])
+            for line in body.splitlines()
+            if line.startswith("data: {")
+        ]
+
+    def test_non_streaming(self):
+        bad = '{{"name": "get_weather", "arguments": {"city": "Tokyo"}}}'
+        (resp,) = self._run(["<tool_call>", bad, "</tool_call>"], stream=False)
+
+        choice = resp["choices"][0]
+        self.assertEqual(choice["finish_reason"], "stop")
+        self.assertNotIn("tool_calls", choice["message"])
+        self.assertEqual(choice["message"]["content"], bad)
+
+    def test_non_streaming_valid_call(self):
+        good = '{"name": "get_weather", "arguments": {"city": "Tokyo"}}'
+        (resp,) = self._run(["<tool_call>", good, "</tool_call>"], stream=False)
+
+        choice = resp["choices"][0]
+        self.assertEqual(choice["finish_reason"], "tool_calls")
+        self.assertEqual(
+            choice["message"]["tool_calls"][0]["function"]["name"], "get_weather"
+        )
+
+    def test_streaming(self):
+        bad = '{{"name": "get_weather", "arguments": {"city": "Tokyo"}}}'
+        chunks = self._run(["<tool_call>", bad, "</tool_call>"], stream=True)
+
+        deltas = [c["choices"][0]["delta"] for c in chunks]
+        self.assertFalse(any("tool_calls" in d for d in deltas))
+        self.assertEqual("".join(d.get("content", "") for d in deltas), bad)
+        self.assertEqual(chunks[-1]["choices"][0]["finish_reason"], "stop")
 
 
 class TestServer(unittest.TestCase):

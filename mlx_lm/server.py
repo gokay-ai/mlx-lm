@@ -75,23 +75,31 @@ class ToolCallFormatter:
         return out
 
     def __call__(self, tool_calls):
+        """Format raw tool call texts.
+
+        Returns the formatted tool calls and the raw text of any tool call
+        that could not be parsed, so it can be returned as content instead
+        of being dropped.
+        """
         if not tool_calls:
-            return []
+            return [], ""
 
         result = []
+        unparsed = ""
         for tool_text in tool_calls:
             try:
                 parsed = self._tool_parser(tool_text, self._tools)
             except (ValueError, json.JSONDecodeError) as e:
                 logging.warning(
-                    f"Failed to parse tool call ({type(e).__name__}: {e}) — "
-                    f"tool text was likely truncated mid-generation."
+                    f"Failed to parse tool call ({type(e).__name__}: {e}), "
+                    f"returning it as text."
                 )
+                unparsed += tool_text
                 continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
             result.extend(self._format(tc) for tc in parsed)
-        return result
+        return result, unparsed
 
 
 def convert_chat(messages: List[dict], role_mapping: Optional[dict] = None):
@@ -1484,7 +1492,6 @@ class APIHandler(BaseHTTPRequestHandler):
                     if prev_state == "tool":
                         tool_calls.append(tool_text)
                         tool_text = ""
-                        made_tool_call = True
                     text += clean_text
 
                 # Add the tokens and logprobs to the vars.
@@ -1499,10 +1506,12 @@ class APIHandler(BaseHTTPRequestHandler):
                     and current_state != "tool"
                     and (text or tool_calls or reasoning_text)
                 ):
+                    formatted_tool_calls, unparsed = tool_formatter(tool_calls)
+                    made_tool_call |= bool(formatted_tool_calls)
                     resp = self.generate_response(
-                        text,
+                        unparsed + text,
                         None,
-                        tool_calls=tool_formatter(tool_calls),
+                        tool_calls=formatted_tool_calls,
                         reasoning_text=reasoning_text,
                     )
                     self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1518,7 +1527,10 @@ class APIHandler(BaseHTTPRequestHandler):
 
             if prev_state == "tool" and tool_text:
                 tool_calls.append(tool_text)
-                made_tool_call = True
+
+            formatted_tool_calls, unparsed = tool_formatter(tool_calls)
+            made_tool_call |= bool(formatted_tool_calls)
+            text = unparsed + text
 
             if finish_reason == "stop" and made_tool_call:
                 finish_reason = "tool_calls"
@@ -1527,7 +1539,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 resp = self.generate_response(
                     text,
                     finish_reason,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=formatted_tool_calls,
                     reasoning_text=reasoning_text,
                 )
                 self.wfile.write(f"data: {json.dumps(resp)}\n\n".encode())
@@ -1556,7 +1568,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     top_tokens=top_tokens,
                     tokens=tokens,
                     reasoning_text=reasoning_text,
-                    tool_calls=tool_formatter(tool_calls),
+                    tool_calls=formatted_tool_calls,
                 )
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     response_debug = json.dumps(resp, indent="\t")
